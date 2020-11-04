@@ -261,25 +261,12 @@ def select_best_k_networks(losses, k, networks):
         networks[index] for index in average_loss_index
     ]
     
-        
-        
-if __name__ == '__main__':
-    X = pd.read_csv("X.csv")
-    y = np.load("y.npy")
-    X = X.values
-    X_val = pd.read_csv("X_val.csv")
-    X_val = X_val.values
-    y_val = np.load("y_val.npy")
-    flip_maape = False
+def evo_auto_ml(number_of_iterations=5, number_of_nets=50, flip_maape=False, learning_rate=0.9, num_steps=100, k_best=10, strategy="average_weights"):
     mated_nets = []
-    learning_rate = 0.9
     optimizer = tf.optimizers.Adam(learning_rate)
-    num_steps = 2
-    k_best = 10
-    strategy = "average_weights"
-    for _ in range(3):
+    for _ in range(number_of_iterations):
         neural_nets = [NeuralNet(X.shape[0], X.shape[1], optimizer, learning_rate=learning_rate, dropout_prob=0.0)
-                       for _ in range(50)]
+                       for _ in range(number_of_nets)]
 
         mse_losses, maape_losses, neural_nets = train_nets(X, y, neural_nets, num_steps)
         best_mse_nets = select_best_k_networks(mse_losses, k_best, neural_nets)
@@ -303,5 +290,16 @@ if __name__ == '__main__':
         min_mses.append(min(mse_loss))
     for maape_loss in maape_losses:
         min_maapes.append(min(maape_loss))
-    print("mse", min(min_mses))
-    print("maape", min(min_maapes))
+    return min(min_mses), min(min_maapes)
+
+        
+if __name__ == '__main__':
+    X = pd.read_csv("X.csv")
+    y = np.load("y.npy")
+    X = X.values
+    X_val = pd.read_csv("X_val.csv")
+    X_val = X_val.values
+    y_val = np.load("y_val.npy")
+    min_mse, min_maape = evo_auto_ml()
+    print("min mse", min_mse)
+    print("min maape", min_maape)
