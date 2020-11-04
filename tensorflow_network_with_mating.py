@@ -32,38 +32,54 @@ class Dense(tf.Module):
         return tf.matmul(x, self.w) + self.b
     
 class NeuralNet(Model):
-    def __init__(self, X_in, X_out, optimizer, dropout=0.1):
+    def __init__(self, X_in, X_out, optimizer, max_random_layers=None, learning_rate=0.9, dropout_prob=0.1):
         super(NeuralNet, self).__init__()
         self.number_of_relu_dense = 0
         self.number_of_vanilla_dense = 0
         self.relu_layers = []
         self.dense_layers = []
-        for _ in range(1, random.randint(2, 10)):
-            self.relu_layers.append(ReluDense(X_in, X_out))
-            self.number_of_relu_dense += 1
-        for _ in range(1, random.randint(2, 10)):
-            self.dense_layers.append(Dense(X_in, X_out))
-            self.number_of_vanilla_dense += 1
+        if max_random_layers is None:
+            for _ in range(4):
+                self.relu_layers.append(ReluDense(X_in, X_out))
+                self.number_of_relu_dense += 1
+            for _ in range(4):
+                self.dense_layers.append(Dense(X_in, X_out))
+                self.number_of_vanilla_dense += 1
+        else:
+            for _ in range(1, random.randint(2, max_random_layers)):
+                self.relu_layers.append(ReluDense(X_in, X_out))
+                self.number_of_relu_dense += 1
+            for _ in range(1, random.randint(2, max_random_layers)):
+                self.dense_layers.append(Dense(X_in, X_out))
+                self.number_of_vanilla_dense += 1
         self.out = Dense(X_in, X_out)
         self.optimizer = optimizer
-        self.dropout = dropout
+        self.dropout_prob = dropout_prob
         self.tape = None
+        self.learning_rate = learning_rate
+
+    def dropout(self, X, drop_probability):
+        keep_probability = 1 - drop_probability
+        mask = np.random.uniform(0, 1.0) < keep_probability
+        if keep_probability > 0.0:
+            scale = (1/keep_probability)
+        else:
+            scale = 0.0
+        return mask * X * scale
 
     def call(self, x, train=False):
         if train:
             for layer in self.relu_layers:
                 x = layer(x)
-                x = dropout(x, self.dropout)
+                x = self.dropout(x, self.dropout_prob)
             for layer in self.dense_layers:
                 x = layer(x)
-                x = dropout(x, self.dropout)
+                x = self.dropout(x, self.dropout_prob)
         else:
             for layer in self.relu_layers:
                 x = layer(x)
-                x = dropout(x, self.dropout)
             for layer in self.dense_layers:
                 x = layer(x)
-                x = dropout(x, self.dropout)
             x = self.out(x)
         return tf.reduce_mean(x, axis=1)
 
@@ -74,7 +90,6 @@ class NeuralNet(Model):
             pred = self.call(x, train=True)
             loss = mse(pred, y)
             self.tape = tape
-            
         gradients = self.tape.gradient(loss, self.trainable_variables)
         self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
 
@@ -104,16 +119,86 @@ class EnsembleNet(Model):
         self.net_one.optimizer.apply_gradients(zip(gradients_one, self.net_one.trainable_variables))
         gradients_two = self.net_two.tape.gradient(loss, self.net_two.trainable_variables)
         self.net_two.optimizer.apply_gradients(zip(gradients_two, self.net_two.trainable_variables))
-    
-def dropout(X, drop_probability):
-    keep_probability = 1 - drop_probability
-    mask = np.random.uniform(0, 1.0) < keep_probability
-    if keep_probability > 0.0:
-        scale = (1/keep_probability)
-    else:
-        scale = 0.0
-    return mask * X * scale
 
+class MateNet(Model):
+    def __init__(self, x, y, net_one, net_two, optimizer, weight=None):
+        super(MateNet, self).__init__()
+        self.net_one = net_one
+        self.net_two = net_two
+        self.optimizer = optimizer
+        if weight is None:
+            self.set_weights(x, y)
+        else:
+            # weight is two numbers between 0 and 1
+            # e.g. [0.5, 0.5]
+            # this is the weight on the result of each network
+            self.weight = weight
+        self.combine_nets(x)
+        
+    def set_weights(self, x, y):
+        x = tf.cast(x, tf.float32)
+        y = tf.cast(y, tf.float32)
+        one_pred = self.net_one.call(x)
+        two_pred = self.net_two.call(x)
+        one_loss = mse(one_pred, y)
+        two_loss = mse(two_pred, y)
+        denominator = one_loss + two_loss
+        self.weight = [
+            tf.cast(one_loss/denominator, tf.float32),
+            tf.cast(two_loss/denominator, tf.float32)
+        ]
+
+    def combine_nets(self, x):
+        optimizer = tf.optimizers.Adam(self.net_one.learning_rate)
+        combined_net = NeuralNet(
+            x.shape[0], x.shape[1],
+            optimizer,
+            learning_rate=learning_rate,
+            dropout_prob=0.0
+        )
+        # check to make sure we have the same number of layers in both networks
+        # otherwise we cannot guarantee that the weighting scheme will be correct
+        assert len(self.net_one.relu_layers) == len(self.net_two.relu_layers)
+        assert len(self.net_one.dense_layers) == len(self.net_two.dense_layers)
+        for index, relu_layer in enumerate(self.net_one.relu_layers):
+            combined_relu_layer = ReluDense(x.shape[0], x.shape[1])
+            combined_relu_layer.w = relu_layer.w * self.weight[0]
+            combined_relu_layer.w += self.net_two.relu_layers[index].w * self.weight[1]
+            combined_relu_layer.b = relu_layer.b * self.weight[0]
+            combined_relu_layer.b += self.net_two.relu_layers[index].b * self.weight[1]
+            combined_net.relu_layers.append(combined_relu_layer)
+        for index, dense_layer in enumerate(self.net_one.dense_layers):
+            combined_dense_layer = Dense(x.shape[0], x.shape[1])
+            combined_dense_layer.w = dense_layer.w * self.weight[0]
+            combined_dense_layer.w += self.net_two.dense_layers[index].w * self.weight[1]
+            combined_dense_layer.b = dense_layer.b * self.weight[0]
+            combined_dense_layer.b += self.net_two.dense_layers[index].b * self.weight[1]
+            combined_net.dense_layers.append(combined_dense_layer)
+
+        combined_net.out.w = self.net_one.out.w * self.weight[0]
+        combined_net.out.w += self.net_two.out.w * self.weight[1]
+        combined_net.out.b = self.net_one.out.b * self.weight[0]
+        combined_net.out.b += self.net_two.out.b * self.weight[1]
+        self.combined_net = combined_net
+        
+    def call(self, x, train=False):
+        for layer in self.combined_net.relu_layers:
+            x = layer(x)
+        for layer in self.combined_net.dense_layers:
+            x = layer(x)
+        x = self.combined_net.out(x)
+        return tf.reduce_mean(x, axis=1)
+
+    def step(self, x, y):
+        x = tf.cast(x, tf.float32)
+        y = tf.cast(y, tf.float32)
+        with tf.GradientTape(persistent=True) as tape:
+            pred = self.call(x, train=True)
+            loss = mse(pred, y)
+            self.tape = tape
+        gradients = self.tape.gradient(loss, self.combined_net.trainable_variables)
+        self.optimizer.apply_gradients(zip(gradients, self.combined_net.trainable_variables))
+        
 def mse(x, y):
     x = tf.cast(x, tf.float64)
     y = tf.cast(y, tf.float64)
@@ -191,8 +276,9 @@ if __name__ == '__main__':
     optimizer = tf.optimizers.Adam(learning_rate)
     num_steps = 2
     k_best = 10
+    strategy = "average_weights"
     for _ in range(3):
-        neural_nets = [NeuralNet(X.shape[0], X.shape[1], optimizer)
+        neural_nets = [NeuralNet(X.shape[0], X.shape[1], optimizer, learning_rate=learning_rate, dropout_prob=0.0)
                        for _ in range(50)]
 
         mse_losses, maape_losses, neural_nets = train_nets(X, y, neural_nets, num_steps)
@@ -201,9 +287,14 @@ if __name__ == '__main__':
         
         if flip_maape:
             best_maape_nets = best_maape_nets[::-1]
-        for index in range(len(best_mse_nets)):
-            ensemble = EnsembleNet(best_mse_nets[index], best_maape_nets[index], [0.5, 0.5])
-            mated_nets.append(ensemble)
+        if strategy == "average_predictions":
+            for index in range(len(best_mse_nets)):
+                ensemble = EnsembleNet(best_mse_nets[index], best_maape_nets[index], [0.5, 0.5])
+                mated_nets.append(ensemble)
+        elif strategy == "average_weights":
+            for index in range(len(best_mse_nets)):
+                ensemble = MateNet(X, y, best_mse_nets[index], best_maape_nets[index], optimizer)
+                mated_nets.append(ensemble)
 
     mse_losses, maape_losses, neural_nets = train_nets(X, y, mated_nets, num_steps)    
     min_mses = []
